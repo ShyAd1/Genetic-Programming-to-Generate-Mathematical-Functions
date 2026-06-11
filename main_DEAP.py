@@ -33,22 +33,22 @@ TARGET_EXPR_STR = "x" # Placeholder
 
 # Parámetros del algoritmo
 POPULATION_SIZE      = 300
-N_GENERATIONS        = 50
+N_GENERATIONS        = 100
 CROSSOVER_PROB       = 0.80
-MUTATION_PROB        = 0.25
+MUTATION_PROB        = 0.20
 TREE_MIN_DEPTH       = 1
-TREE_MAX_DEPTH       = 6
-TREE_HEIGHT_LIMIT    = 17
+TREE_MAX_DEPTH       = 4   # población inicial más compacta
+TREE_HEIGHT_LIMIT    = 6   # límite duro: máximo 6 niveles de profundidad
 
-# Penalización por complejidad: fitness = MSE + COMPLEXITY_WEIGHT * len(árbol)
-# Valor bajo para no penalizar expresiones complejas correctas
-COMPLEXITY_WEIGHT    = 0.0001
+# Penalización por complejidad — suficientemente alta para desincentivar bloat
+# Un árbol de 20 nodos añade 0.02 al fitness; uno de 5 nodos añade 0.005
+COMPLEXITY_WEIGHT    = 0.001
 
 # Parada anticipada: detiene la evolución si MSE < umbral
-EARLY_STOP_THRESHOLD = 1e-4
+EARLY_STOP_THRESHOLD = 1e-2
 
-# Puntos de evaluación: cuadrícula [-5, 5] x [-5, 5]
-EVAL_RANGE           = range(-50, 51)  # puntos cada 0.1 en [-5, 5]
+# Puntos de evaluación: cuadrícula [-100, 100] x [-100, 100]
+EVAL_RANGE           = range(-100, 101)  # puntos cada 0.1 en [-10, 10]
 EVAL_POINTS          = [
     (x / 10.0, y / 10.0) for x in EVAL_RANGE for y in EVAL_RANGE
 ]
@@ -61,7 +61,7 @@ _EVAL_Y = np.array([y / 10.0 for x in EVAL_RANGE for y in EVAL_RANGE])
 _TARGET_VALUES = None  # se inicializa al cargar la función objetivo
 
 # Semilla para reproducibilidad
-RANDOM_SEED          = 42  # random.randint(0, 10000)
+RANDOM_SEED          = random.randint(0, 10000)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -141,6 +141,11 @@ def protectedDiv(left, right):
         result = np.where(np.abs(right) > 1e-10, left / right, 1.0)
     return float(result) if np.ndim(result) == 0 else result
 
+def np_add(a, b):  return np.add(a, b)
+def np_sub(a, b):  return np.subtract(a, b)
+def np_mul(a, b):  return np.multiply(a, b)
+def np_neg(a):     return np.negative(a)
+
 def protectedSqrt(x):
     return np.sqrt(np.abs(x))
 
@@ -168,12 +173,12 @@ def np_cos(x):
 
 pset = gp.PrimitiveSet("MAIN", 2)
 
-# Operadores aritméticos
-pset.addPrimitive(operator.add, 2)
-pset.addPrimitive(operator.sub, 2)
-pset.addPrimitive(operator.mul, 2)
-pset.addPrimitive(protectedDiv, 2)
-pset.addPrimitive(operator.neg, 1)
+# Operadores aritméticos (wrappers NumPy — funcionan con escalares Y arrays)
+pset.addPrimitive(np_add,        2)
+pset.addPrimitive(np_sub,        2)
+pset.addPrimitive(np_mul,        2)
+pset.addPrimitive(protectedDiv,  2)
+pset.addPrimitive(np_neg,        1)
 
 # Operadores extendidos (todos compatibles con arrays NumPy)
 pset.addPrimitive(np_sin,        1)
@@ -183,7 +188,8 @@ pset.addPrimitive(protectedLog,  1)
 pset.addPrimitive(protectedExp,  1)
 pset.addPrimitive(protectedAbs,  1)
 
-pset.addEphemeralConstant("rand101", partial(random.uniform, -3.0, 3.0))
+# Constantes enteras [-10, 10]: más compactas y útiles que floats aleatorios continuos
+pset.addEphemeralConstant("rand101", partial(random.randint, -10, 10))
 pset.renameArguments(ARG0="x")
 pset.renameArguments(ARG1="y")
 
@@ -219,15 +225,18 @@ def evalSymbReg(individual, points):
     if _TARGET_VALUES is not None:
         y_true_arr, mask = _TARGET_VALUES
         try:
-            raw_pred = func(_EVAL_X, _EVAL_Y)
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                raw_pred = func(_EVAL_X, _EVAL_Y)
             y_pred_arr = np.asarray(raw_pred, dtype=float).ravel()
             if y_pred_arr.shape != y_true_arr.shape:
                 y_pred_arr = np.broadcast_to(y_pred_arr, y_true_arr.shape).copy()
-            valid = mask & np.isfinite(y_pred_arr) & (np.abs(y_pred_arr) < 1e6)
+            valid = mask & np.isfinite(y_pred_arr)
             if not np.any(valid):
                 return (PENALTY,)
             errors = y_pred_arr[valid] - y_true_arr[valid]
             mse = float(np.mean(errors ** 2))
+            if not math.isfinite(mse):
+                return (PENALTY,)
         except Exception:
             return (PENALTY,)
     else:
@@ -250,15 +259,19 @@ def evalSymbReg(individual, points):
 
 
 toolbox.register("evaluate", evalSymbReg, points=EVAL_POINTS)
-toolbox.register("select",   tools.selTournament, tournsize=3)
-toolbox.register("mate",     gp.cxOnePoint)
-toolbox.register("expr_mut", gp.genFull, min_=0, max_=2)
-toolbox.register("mutate",   gp.mutUniform, expr=toolbox.expr_mut, pset=pset)
+toolbox.register("select",   tools.selTournament, tournsize=5)
+toolbox.register("mate",     gp.cxOnePointLeafBiased, termpb=0.3)
+toolbox.register("expr_mut", gp.genHalfAndHalf, min_=0, max_=3)
+toolbox.register("mutate",       gp.mutUniform,          expr=toolbox.expr_mut, pset=pset)
+toolbox.register("mutate_shrink", gp.mutShrink)
+toolbox.register("mutate_node",   gp.mutNodeReplacement,  pset=pset)
 
-toolbox.decorate("mate",   gp.staticLimit(key=operator.attrgetter("height"),
-                                          max_value=TREE_HEIGHT_LIMIT))
-toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"),
-                                          max_value=TREE_HEIGHT_LIMIT))
+toolbox.decorate("mate",        gp.staticLimit(key=operator.attrgetter("height"),
+                                               max_value=TREE_HEIGHT_LIMIT))
+toolbox.decorate("mutate",      gp.staticLimit(key=operator.attrgetter("height"),
+                                               max_value=TREE_HEIGHT_LIMIT))
+toolbox.decorate("mutate_node", gp.staticLimit(key=operator.attrgetter("height"),
+                                               max_value=TREE_HEIGHT_LIMIT))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -268,17 +281,38 @@ toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"),
 def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=True):
     """
     Bucle evolutivo personalizado con:
+      - Elitismo (preserva el mejor individuo)
+      - Mutación mixta: uniforme (50%), shrink (30%), reemplazo de nodo (20%)
+      - Poda activa: cualquier árbol que supere TREE_HEIGHT_LIMIT se reemplaza
       - Parada anticipada cuando MSE < EARLY_STOP_THRESHOLD
-      - Registro del mejor individuo por generación
-      - Cálculo de diversidad genética (fracción de árboles únicos)
     """
-    logbook          = tools.Logbook()
-    logbook.header   = ["gen", "nevals"] + (stats.fields if stats else [])
+    logbook         = tools.Logbook()
+    logbook.header  = ["gen", "nevals"] + (stats.fields if stats else [])
+    best_per_gen    = []
+    diversity_per_gen = []
 
-    best_per_gen     = []   # Mejor individuo clonado por generación
-    diversity_per_gen = []  # Proporción de individuos únicos
+    def _apply_mutation(ind):
+        """Aplica una de tres mutaciones según probabilidad."""
+        r = random.random()
+        if r < 0.50:
+            toolbox.mutate(ind)       # mutUniform: reemplaza subárbol
+        elif r < 0.80:
+            toolbox.mutate_shrink(ind) # shrink: contrae subárbol a un terminal
+        else:
+            toolbox.mutate_node(ind)  # nodeReplacement: cambia un nodo
+        del ind.fitness.values
+        return ind
 
-    # ── Generación 0: evaluar población inicial ──────────────
+    def _enforce_height(ind):
+        """Si el árbol supera el límite, aplica shrink hasta que cumpla."""
+        attempts = 0
+        while ind.height > TREE_HEIGHT_LIMIT and attempts < 5:
+            toolbox.mutate_shrink(ind)
+            del ind.fitness.values
+            attempts += 1
+        return ind
+
+    # ── Generación 0 ────────────────────────────────────────
     invalid = [ind for ind in pop if not ind.fitness.valid]
     for ind, fit in zip(invalid, map(toolbox.evaluate, invalid)):
         ind.fitness.values = fit
@@ -296,9 +330,10 @@ def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=Tr
 
     early_stopped = False
 
-    # ── Generaciones 1..ngen ─────────────────────────────────
+    # ── Generaciones 1..ngen ────────────────────────────────
     for gen in range(1, ngen + 1):
-        offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
+        elite = toolbox.clone(halloffame[0])
+        offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop) - 1)))
 
         # Cruza
         for c1, c2 in zip(offspring[::2], offspring[1::2]):
@@ -307,18 +342,22 @@ def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=Tr
                 del c1.fitness.values
                 del c2.fitness.values
 
-        # Mutación
+        # Mutación mixta
         for mutant in offspring:
             if random.random() < mutpb:
-                toolbox.mutate(mutant)
-                del mutant.fitness.values
+                _apply_mutation(mutant)
 
-        # Evaluar
+        # Poda activa de árboles fuera de límite
+        for ind in offspring:
+            if ind.height > TREE_HEIGHT_LIMIT:
+                _enforce_height(ind)
+
+        # Evaluar modificados
         invalid = [ind for ind in offspring if not ind.fitness.valid]
         for ind, fit in zip(invalid, map(toolbox.evaluate, invalid)):
             ind.fitness.values = fit
 
-        pop[:] = offspring
+        pop[:] = offspring + [elite]
 
         if halloffame is not None:
             halloffame.update(pop)
@@ -331,11 +370,8 @@ def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=Tr
         best_per_gen.append(toolbox.clone(halloffame[0]))
         diversity_per_gen.append(len(set(str(i) for i in pop)) / len(pop))
 
-        # ── Parada anticipada ────────────────────────────────
         current_best = halloffame[0].fitness.values[0]
         if current_best < EARLY_STOP_THRESHOLD:
-            # print(f"\n Parada anticipada en generación {gen}: "
-            #       f"fitness = {current_best:.2e} < {EARLY_STOP_THRESHOLD:.2e}")
             early_stopped = True
             break
 
@@ -347,10 +383,15 @@ def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=Tr
 # ══════════════════════════════════════════════════════════════
 
 _OP_MAP = {
+    "np_add":       lambda a, b: a + b,
+    "np_sub":       lambda a, b: a - b,
+    "np_mul":       lambda a, b: a * b,
+    "protectedDiv": lambda a, b: a / b,
+    "np_neg":       lambda a:    -a,
+    # keep old names as fallback in case old pickled individuals exist
     "add":          lambda a, b: a + b,
     "sub":          lambda a, b: a - b,
     "mul":          lambda a, b: a * b,
-    "protectedDiv": lambda a, b: a / b,
     "neg":          lambda a:    -a,
     "np_sin":       lambda a:    sp.sin(a),
     "np_cos":       lambda a:    sp.cos(a),
@@ -598,12 +639,22 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
         return arr
 
     def _evaluate_surface(func, X, Y):
-        surface = numpy.empty(X.shape, dtype=float)
-        for row_idx in range(X.shape[0]):
-            for col_idx in range(X.shape[1]):
-                value = _scalar_or_none(func(X[row_idx, col_idx], Y[row_idx, col_idx]))
-                surface[row_idx, col_idx] = numpy.nan if value is None else value
-        return surface
+        """Evalúa func sobre la cuadrícula X,Y de forma vectorizada."""
+        try:
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                Z = np.asarray(func(X, Y), dtype=float)
+            if Z.shape != X.shape:
+                Z = np.broadcast_to(Z, X.shape).copy()
+            Z[~np.isfinite(Z)] = np.nan
+            return Z
+        except Exception:
+            # fallback escalar
+            surface = numpy.empty(X.shape, dtype=float)
+            for r in range(X.shape[0]):
+                for c in range(X.shape[1]):
+                    v = _scalar_or_none(func(X[r, c], Y[r, c]))
+                    surface[r, c] = numpy.nan if v is None else v
+            return surface
 
     generations  = log.select("gen")
     min_fitness  = log.chapters["fitness"].select("min")
@@ -682,8 +733,8 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
 
     # ── Superficies 3D: real | aproximada | error absoluto ──────
     best_func = toolbox.compile(expr=hof[0])
-    x = numpy.linspace(-1, 1, 40)
-    y = numpy.linspace(-1, 1, 40)
+    x = numpy.linspace(-5, 5, 40)
+    y = numpy.linspace(-5, 5, 40)
     X, Y = numpy.meshgrid(x, y)
 
     Z_real_raw = _evaluate_surface(target_function, X, Y)
@@ -995,8 +1046,8 @@ if QT_AVAILABLE:
             evo_table_layout.addWidget(evo_table_desc)
             evo_table_layout.addWidget(self.evolution_table, 1)
 
-            self.summary_tabs.addTab(self.summary_text, "📄 Reporte")
-            self.summary_tabs.addTab(evo_table_widget, "📈 Evolución")
+            self.summary_tabs.addTab(self.summary_text, "Reporte")
+            self.summary_tabs.addTab(evo_table_widget, "Evolución")
 
             self.metrics_text = QtWidgets.QPlainTextEdit()
             self.metrics_text.setReadOnly(True)
@@ -1052,7 +1103,7 @@ if QT_AVAILABLE:
                 "<b>⑥ Tamaño del mejor individuo:</b> si el campeón crece mucho sin mejorar el error, la solución es probablemente redundante."
             )
             surf_desc = (
-                "<b>Comparación de superficies 3D en la cuadrícula [-1, 1] × [-1, 1]</b><br>"
+                "<b>Comparación de superficies 3D en la cuadrícula [-5, 5] × [-5, 5]</b><br>"
                 "<b>Izquierda — Función objetivo:</b> la superficie real f(x,y) que el algoritmo intenta aproximar.<br>"
                 "<b>Centro — Mejor aproximación DEAP:</b> la expresión simbólica encontrada por el algoritmo genético. "
                 "Idealmente debe tener la misma forma que la función objetivo.<br>"
@@ -1134,7 +1185,7 @@ que aproxime la función objetivo que tú defines. El algoritmo evoluciona una p
   <li>Evita divisiones sin protección: usa <code>Abs(y) + 1</code> en el denominador.</li>
   <li>Evita <code>log</code> o <code>sqrt</code> de valores negativos; usa <code>Abs(...)</code> dentro.</li>
   <li>Las funciones muy complejas o con valores extremos pueden resultar en errores de evaluación.</li>
-  <li>La función se evalúa en la cuadrícula <b>[-5, 5] × [-5, 5]</b> con paso 0.1.</li>
+  <li>La función se evalúa en la cuadrícula <b>[-10, 10] × [-10, 10]</b> con paso 0.1.</li>
 </ul>
 
 <h3 style="color:#34d399;">Pestañas de resultados</h3>
