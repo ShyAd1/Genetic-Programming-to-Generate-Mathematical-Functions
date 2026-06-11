@@ -7,8 +7,8 @@ import sys
 from pathlib import Path
 from functools import partial
 
-import numpy
 import numpy as np
+numpy = np  # alias for legacy references
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -29,19 +29,20 @@ from deap import base, creator, tools, gp, algorithms
 # ══════════════════════════════════════════════════════════════
 
 # Función objetivo como cadena de texto (usa x e y como variables)
-TARGET_EXPR_STR = "x**2 + y**2*x**2 + 1"
+TARGET_EXPR_STR = "x" # Placeholder
 
 # Parámetros del algoritmo
 POPULATION_SIZE      = 300
-N_GENERATIONS        = 100
+N_GENERATIONS        = 50
 CROSSOVER_PROB       = 0.80
-MUTATION_PROB        = 0.10
+MUTATION_PROB        = 0.25
 TREE_MIN_DEPTH       = 1
 TREE_MAX_DEPTH       = 6
 TREE_HEIGHT_LIMIT    = 17
 
 # Penalización por complejidad: fitness = MSE + COMPLEXITY_WEIGHT * len(árbol)
-COMPLEXITY_WEIGHT    = 0.005
+# Valor bajo para no penalizar expresiones complejas correctas
+COMPLEXITY_WEIGHT    = 0.0001
 
 # Parada anticipada: detiene la evolución si MSE < umbral
 EARLY_STOP_THRESHOLD = 1e-4
@@ -51,6 +52,13 @@ EVAL_RANGE           = range(-50, 51)  # puntos cada 0.1 en [-5, 5]
 EVAL_POINTS          = [
     (x / 10.0, y / 10.0) for x in EVAL_RANGE for y in EVAL_RANGE
 ]
+
+# Arrays vectorizados para evaluación rápida (se calculan una sola vez)
+# EVAL_POINTS = [(x,y) for x in EVAL_RANGE for y in EVAL_RANGE]
+# → x varía en el loop externo, y en el interno
+_EVAL_X = np.array([x / 10.0 for x in EVAL_RANGE for y in EVAL_RANGE])
+_EVAL_Y = np.array([y / 10.0 for x in EVAL_RANGE for y in EVAL_RANGE])
+_TARGET_VALUES = None  # se inicializa al cargar la función objetivo
 
 # Semilla para reproducibilidad
 RANDOM_SEED          = 42  # random.randint(0, 10000)
@@ -69,7 +77,7 @@ def build_target_function(expr_str: str):
     try:
         sympy_expr = sp.sympify(expr_str)
         lambdified = sp.lambdify((x_sym, y_sym), sympy_expr, "numpy")
-        print(f"✔ Función objetivo cargada: f(x,y) = {sympy_expr}")
+        # print(f"✔ Función objetivo cargada: f(x,y) = {sympy_expr}")
         return lambdified
     except Exception as e:
         raise ValueError(f"No se pudo parsear la función objetivo '{expr_str}': {e}")
@@ -83,85 +91,75 @@ def target_function(x, y):
 
 def set_target_expression(expr_str: str):
     """Actualiza la función objetivo usada por la evaluación."""
-    global TARGET_EXPR_STR, _target_fn
+    global TARGET_EXPR_STR, _target_fn, _TARGET_VALUES
     TARGET_EXPR_STR = expr_str
     _target_fn = build_target_function(expr_str)
+    # Precomputar valores objetivo vectorizados una sola vez
+    try:
+        raw = _target_fn(_EVAL_X, _EVAL_Y)
+        arr = np.asarray(raw, dtype=float).ravel()
+        mask = np.isfinite(arr)
+        _TARGET_VALUES = (arr, mask)
+    except Exception:
+        _TARGET_VALUES = None
 
 
-def generate_random_target_expression(max_depth: int = 3, require_both: bool = False):
-    """Genera una expresión simbólica aleatoria y relativamente estable.
+def _scalar_or_none(value):
+    """Convierte un valor a float escalar si es finito; si no, devuelve None."""
+    if isinstance(value, numpy.ndarray):
+        if value.shape != ():
+            return None
+        value = value.item()
 
-    If require_both=True the expression is guaranteed to contain both `x` and `y`.
-    """
-    terminals = ["x", "y", "-3", "-2", "-1", "0", "1", "2", "3"]
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
 
-    def build(depth: int):
-        if depth <= 0:
-            return random.choice(terminals)
+    return value if math.isfinite(value) else None
 
-        op = random.choice(["add", "sub", "mul", "div", "sin", "cos", "sqrt", "log", "abs", "neg"])
 
-        if op == "add":
-            return f"({build(depth - 1)} + {build(depth - 1)})"
-        if op == "sub":
-            return f"({build(depth - 1)} - {build(depth - 1)})"
-        if op == "mul":
-            return f"({build(depth - 1)} * {build(depth - 1)})"
-        if op == "div":
-            numerator = build(depth - 1)
-            denominator = build(depth - 1)
-            return f"({numerator} / (Abs({denominator}) + 1))"
-        if op == "sin":
-            return f"sin({build(depth - 1)})"
-        if op == "cos":
-            return f"cos({build(depth - 1)})"
-        if op == "sqrt":
-            return f"sqrt(Abs({build(depth - 1)}))"
-        if op == "log":
-            return f"log(Abs({build(depth - 1)}) + 1e-3)"
-        if op == "abs":
-            return f"Abs({build(depth - 1)})"
-        return f"(-{build(depth - 1)})"
+def _safe_target_value(x, y):
+    try:
+        return _scalar_or_none(target_function(x, y))
+    except Exception:
+        return None
 
-    # Asegurar que la expresión contenga variables según el requisito
-    for _ in range(24):
-        expr = build(max_depth)
-        has_x = "x" in expr
-        has_y = "y" in expr
-        if require_both:
-            if has_x and has_y:
-                return expr
-        else:
-            if has_x or has_y:
-                return expr
-    return expr
 
+def _safe_prediction_value(func, x, y):
+    try:
+        return _scalar_or_none(func(x, y))
+    except Exception:
+        return None
 
 # ══════════════════════════════════════════════════════════════
 # SECCIÓN 3 — OPERADORES PROTEGIDOS EXTENDIDOS
 # ══════════════════════════════════════════════════════════════
 
 def protectedDiv(left, right):
-    try:
-        return left / right
-    except ZeroDivisionError:
-        return 1.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = np.where(np.abs(right) > 1e-10, left / right, 1.0)
+    return float(result) if np.ndim(result) == 0 else result
 
 def protectedSqrt(x):
-    return math.sqrt(abs(x))
+    return np.sqrt(np.abs(x))
 
 def protectedLog(x):
-    return math.log(abs(x)) if abs(x) > 1e-10 else 0.0
+    ax = np.abs(x)
+    return np.where(ax > 1e-10, np.log(ax), 0.0)
 
 def protectedExp(x):
-    try:
-        result = math.exp(min(x, 700))   # evita overflow
-        return result if math.isfinite(result) else 1.0
-    except OverflowError:
-        return 1.0
+    with np.errstate(over="ignore"):
+        return np.where(np.isfinite(x), np.exp(np.clip(x, -700, 700)), 1.0)
 
 def protectedAbs(x):
-    return abs(x)
+    return np.abs(x)
+
+def np_sin(x):
+    return np.sin(x)
+
+def np_cos(x):
+    return np.cos(x)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -177,9 +175,9 @@ pset.addPrimitive(operator.mul, 2)
 pset.addPrimitive(protectedDiv, 2)
 pset.addPrimitive(operator.neg, 1)
 
-# Operadores extendidos
-pset.addPrimitive(math.sin,     1)
-pset.addPrimitive(math.cos,     1)
+# Operadores extendidos (todos compatibles con arrays NumPy)
+pset.addPrimitive(np_sin,        1)
+pset.addPrimitive(np_cos,        1)
 pset.addPrimitive(protectedSqrt, 1)
 pset.addPrimitive(protectedLog,  1)
 pset.addPrimitive(protectedExp,  1)
@@ -210,40 +208,43 @@ def evalSymbReg(individual, points):
     """
     Fitness = MSE + COMPLEXITY_WEIGHT * tamaño_árbol
 
-    La penalización por complejidad desincentiva árboles muy grandes
-    (bloat) sin comprometer demasiado la precisión.
+    Evaluación vectorizada con NumPy: compila el árbol GP como función
+    y la aplica sobre los arrays de puntos de una sola vez, eliminando
+    el costoso loop Python punto a punto.
     """
     func = toolbox.compile(expr=individual)
     PENALTY = 1e20
-    sqerrors = []
 
-    for x, y in points:
+    # Evaluación vectorizada
+    if _TARGET_VALUES is not None:
+        y_true_arr, mask = _TARGET_VALUES
         try:
-            pred = func(x, y)
-            # Convert to float if possible and guard against extreme values
-            if isinstance(pred, (list, tuple, numpy.ndarray)):
-                # We expect scalar predictions; if not, penalize
+            raw_pred = func(_EVAL_X, _EVAL_Y)
+            y_pred_arr = np.asarray(raw_pred, dtype=float).ravel()
+            if y_pred_arr.shape != y_true_arr.shape:
+                y_pred_arr = np.broadcast_to(y_pred_arr, y_true_arr.shape).copy()
+            valid = mask & np.isfinite(y_pred_arr) & (np.abs(y_pred_arr) < 1e6)
+            if not np.any(valid):
                 return (PENALTY,)
-            pred = float(pred)
-            if not math.isfinite(pred) or abs(pred) > 1e6:
-                return (PENALTY,)
-
-            true = target_function(x, y)
-            if isinstance(true, (list, tuple, numpy.ndarray)):
-                return (PENALTY,)
-            true = float(true)
-
-            error = pred - true
-            sq = error * error
-        except (OverflowError, ZeroDivisionError, ValueError, FloatingPointError, TypeError):
+            errors = y_pred_arr[valid] - y_true_arr[valid]
+            mse = float(np.mean(errors ** 2))
+        except Exception:
             return (PENALTY,)
-
-        if not math.isfinite(sq):
+    else:
+        # Fallback escalar si _TARGET_VALUES no está disponible
+        sqerrors = []
+        for x, y in points:
+            true = _safe_target_value(x, y)
+            if true is None:
+                continue
+            pred = _safe_prediction_value(func, x, y)
+            if pred is None or abs(pred) > 1e6:
+                return (PENALTY,)
+            sqerrors.append((pred - true) ** 2)
+        if not sqerrors:
             return (PENALTY,)
+        mse = math.fsum(sqerrors) / len(sqerrors)
 
-        sqerrors.append(sq)
-
-    mse              = math.fsum(sqerrors) / len(points)
     complexity_bonus = COMPLEXITY_WEIGHT * len(individual)
     return (mse + complexity_bonus,)
 
@@ -333,8 +334,8 @@ def run_evolution(pop, toolbox, cxpb, mutpb, ngen, stats, halloffame, verbose=Tr
         # ── Parada anticipada ────────────────────────────────
         current_best = halloffame[0].fitness.values[0]
         if current_best < EARLY_STOP_THRESHOLD:
-            print(f"\n⏹  Parada anticipada en generación {gen}: "
-                  f"fitness = {current_best:.2e} < {EARLY_STOP_THRESHOLD:.2e}")
+            # print(f"\n Parada anticipada en generación {gen}: "
+            #       f"fitness = {current_best:.2e} < {EARLY_STOP_THRESHOLD:.2e}")
             early_stopped = True
             break
 
@@ -351,8 +352,8 @@ _OP_MAP = {
     "mul":          lambda a, b: a * b,
     "protectedDiv": lambda a, b: a / b,
     "neg":          lambda a:    -a,
-    "sin":          lambda a:    sp.sin(a),
-    "cos":          lambda a:    sp.cos(a),
+    "np_sin":       lambda a:    sp.sin(a),
+    "np_cos":       lambda a:    sp.cos(a),
     "protectedSqrt": lambda a:  sp.sqrt(sp.Abs(a)),
     "protectedLog":  lambda a:  sp.log(sp.Abs(a) + sp.Float(1e-10)),
     "protectedExp":  lambda a:  sp.exp(a),
@@ -360,7 +361,11 @@ _OP_MAP = {
 }
 
 def simplify_best_individual(individual):
-    """Convierte el árbol DEAP a expresión SymPy y la simplifica."""
+    """Convierte el árbol DEAP a una expresión SymPy equivalente.
+
+    La conversión evita una simplificación agresiva para que la expresión
+    impresa en el reporte se mantenga alineada con el árbol original.
+    """
     x_sym, y_sym = sp.symbols("x y")
 
     def _to_sympy(tree, idx=0):
@@ -375,9 +380,12 @@ def simplify_best_individual(individual):
             if node.name in ("y", "ARG1"):
                 return y_sym, idx + 1
             try:
-                return sp.Integer(int(node.value)), idx + 1
+                return sp.Float(node.value), idx + 1
             except Exception:
-                return sp.symbols(node.name), idx + 1
+                try:
+                    return sp.Float(str(node)), idx + 1
+                except Exception:
+                    return sp.symbols(node.name), idx + 1
 
         # Nodo interno
         args, next_idx = [], idx + 1
@@ -396,11 +404,7 @@ def simplify_best_individual(individual):
 
     try:
         expr, _ = _to_sympy(individual)
-        if expr is None:
-            return None
-        simplified = sp.simplify(expr)
-        expanded   = sp.expand(simplified)
-        return expanded if str(expanded) != str(simplified) else simplified
+        return expr
     except Exception as e:
         print(f"Error al simplificar: {e}")
         return None
@@ -411,60 +415,49 @@ def simplify_best_individual(individual):
 # ══════════════════════════════════════════════════════════════
 
 def compute_metrics(individual, points):
-    """Calcula MSE, RMSE, MAE y R² para el mejor individuo."""
+    """Calcula MSE, RMSE, MAE y R² para el mejor individuo (vectorizado)."""
     func = toolbox.compile(expr=individual)
-    sq_errors, abs_errors, y_true, y_pred = [], [], [], []
 
-    for x, y in points:
+    if _TARGET_VALUES is not None:
+        y_true_arr, mask = _TARGET_VALUES
         try:
-            pred = func(x, y)
-            true = target_function(x, y)
-            if math.isfinite(pred) and math.isfinite(true):
-                sq_errors.append((pred - true) ** 2)
-                abs_errors.append(abs(pred - true))
-                y_true.append(true)
-                y_pred.append(pred)
+            raw_pred = func(_EVAL_X, _EVAL_Y)
+            y_pred_arr = np.asarray(raw_pred, dtype=float).ravel()
+            if y_pred_arr.shape != y_true_arr.shape:
+                y_pred_arr = np.broadcast_to(y_pred_arr, y_true_arr.shape).copy()
+            valid = mask & np.isfinite(y_pred_arr)
+            if not np.any(valid):
+                return None
+            yt = y_true_arr[valid]
+            yp = y_pred_arr[valid]
         except Exception:
-            pass
+            return None
+    else:
+        yt_list, yp_list = [], []
+        for x, y in points:
+            true = _safe_target_value(x, y)
+            pred = _safe_prediction_value(func, x, y)
+            if true is None or pred is None:
+                continue
+            yt_list.append(true); yp_list.append(pred)
+        if not yt_list:
+            return None
+        yt = np.array(yt_list)
+        yp = np.array(yp_list)
 
-    if not sq_errors:
-        return None
+    sq_errors = (yp - yt) ** 2
+    mse    = float(np.mean(sq_errors))
+    mae    = float(np.mean(np.abs(yp - yt)))
+    ss_res = float(np.sum(sq_errors))
+    ss_tot = float(np.sum((yt - yt.mean()) ** 2))
+    r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
 
-    y_true_arr = numpy.array(y_true)
-    mse   = numpy.mean(sq_errors)
-    mae   = numpy.mean(abs_errors)
-    ss_res = numpy.sum(sq_errors)
-    ss_tot = numpy.sum((y_true_arr - y_true_arr.mean()) ** 2)
-    r2    = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-    return {
-        "MSE":  mse,
-        "RMSE": math.sqrt(mse),
-        "MAE":  mae,
-        "R²":   r2,
-    }
+    return {"MSE": mse, "RMSE": math.sqrt(mse), "MAE": mae, "R²": r2}
 
 
 # ══════════════════════════════════════════════════════════════
 # SECCIÓN 9 — VISUALIZACIÓN DEL ÁRBOL DE EXPRESIÓN
 # ══════════════════════════════════════════════════════════════
-
-def _hierarchy_pos(G, root, width=1.0, vert_gap=0.25, vert_loc=0.0,
-                   xcenter=0.5, pos=None):
-    """Layout jerárquico sin dependencia de Graphviz."""
-    if pos is None:
-        pos = {}
-    pos[root] = (xcenter, vert_loc)
-    children = list(G.successors(root))
-    if children:
-        dx = width / len(children)
-        x0 = xcenter - width / 2 + dx / 2
-        for i, child in enumerate(children):
-            pos = _hierarchy_pos(G, child, width=dx, vert_gap=vert_gap,
-                                 vert_loc=vert_loc - vert_gap,
-                                 xcenter=x0 + i * dx, pos=pos)
-    return pos
-
 
 def plot_expression_tree(individual, output_dir, filename="arbol_expresion.png"):
     """Dibuja el árbol de expresión GP usando NetworkX."""
@@ -475,10 +468,63 @@ def plot_expression_tree(individual, output_dir, filename="arbol_expresion.png")
     g.add_edges_from(edges)
 
     root = nodes[0] if nodes else 0
+
+    def _subtree_leaf_count(node, cache):
+        if node in cache:
+            return cache[node]
+        children = list(g.successors(node))
+        if not children:
+            cache[node] = 1
+            return 1
+        count = sum(_subtree_leaf_count(child, cache) for child in children)
+        cache[node] = count
+        return count
+
+    def _tree_layout(graph, root_node, x_gap=3.1, y_gap=2.2):
+        leaf_cache = {}
+        _subtree_leaf_count(root_node, leaf_cache)
+        positions = {}
+
+        def _assign(node, left_x, depth):
+            children = list(graph.successors(node))
+            if not children:
+                positions[node] = (left_x, -depth * y_gap)
+                return left_x + x_gap
+
+            current_x = left_x
+            child_centers = []
+            for child in children:
+                current_x = _assign(child, current_x, depth + 1)
+                child_centers.append(positions[child][0])
+
+            positions[node] = (sum(child_centers) / len(child_centers), -depth * y_gap)
+            return current_x
+
+        _assign(root_node, 0.0, 0)
+        return positions
+
     try:
         pos = nx.drawing.nx_agraph.graphviz_layout(g, prog="dot")
     except Exception:
-        pos = _hierarchy_pos(g, root)
+        pos = _tree_layout(g, root)
+
+    def _wrap_label(text, width=12):
+        text = str(text)
+        if len(text) <= width:
+            return text
+        return "\n".join(text[i:i + width] for i in range(0, len(text), width))
+
+    max_label_len = max((len(str(label)) for label in labels.values()), default=1)
+    wrap_width = 8 if max_label_len > 10 else 12
+    wrapped_labels = {node: _wrap_label(labels.get(node, ""), width=wrap_width) for node in g.nodes()}
+
+    def _estimate_node_size(text):
+        lines = str(text).split("\n")
+        longest = max((len(line) for line in lines), default=1)
+        return max(2400, 380 * longest * len(lines))
+
+    node_sizes = [_estimate_node_size(wrapped_labels.get(node, "")) for node in g.nodes()]
+    font_size = 10 if max_label_len <= 12 else max(7, 13 - max_label_len // 5)
 
     # Colorear nodos según tipo
     node_colors = []
@@ -493,13 +539,22 @@ def plot_expression_tree(individual, output_dir, filename="arbol_expresion.png")
             else:
                 node_colors.append("#2980b9")   # operador → azul
 
-    fig, ax = plt.subplots(figsize=(max(12, len(nodes) * 0.6), 7))
+    x_values = [x for x, _ in pos.values()] if pos else [0]
+    y_values = [y for _, y in pos.values()] if pos else [0]
+    width = max(14, (max(x_values) - min(x_values) + 4) if x_values else 14)
+    height = max(8, abs(min(y_values)) + 3 if y_values else 8)
+    fig, ax = plt.subplots(figsize=(width, height))
     nx.draw(
-        g, pos, ax=ax, labels=labels, with_labels=True,
-        node_color=node_colors, node_size=900,
-        font_size=8, font_color="white", font_weight="bold",
+        g, pos, ax=ax, labels=wrapped_labels, with_labels=True,
+        node_color=node_colors, node_size=node_sizes, node_shape="s",
+        font_size=font_size, font_color="white", font_weight="bold",
         arrows=True, arrowsize=12, edge_color="#7f8c8d", width=1.5,
     )
+    ax.margins(x=0.12, y=0.18)
+    if pos:
+        ax.set_xlim(min(x_values) - 2.0, max(x_values) + 2.0)
+        ax.set_ylim(min(y_values) - 2.5, max(y_values) + 2.5)
+    ax.set_axis_off()
 
     # Leyenda
     from matplotlib.patches import Patch
@@ -539,7 +594,16 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
             arr = numpy.full(shape_like, float(arr))
         elif arr.shape != shape_like:
             arr = numpy.broadcast_to(arr, shape_like)
-        return numpy.nan_to_num(arr, nan=0.0, posinf=1e6, neginf=-1e6)
+        arr = numpy.where(numpy.isfinite(arr), arr, numpy.nan)
+        return arr
+
+    def _evaluate_surface(func, X, Y):
+        surface = numpy.empty(X.shape, dtype=float)
+        for row_idx in range(X.shape[0]):
+            for col_idx in range(X.shape[1]):
+                value = _scalar_or_none(func(X[row_idx, col_idx], Y[row_idx, col_idx]))
+                surface[row_idx, col_idx] = numpy.nan if value is None else value
+        return surface
 
     generations  = log.select("gen")
     min_fitness  = log.chapters["fitness"].select("min")
@@ -622,11 +686,8 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
     y = numpy.linspace(-1, 1, 40)
     X, Y = numpy.meshgrid(x, y)
 
-    Z_real_raw = target_function(X, Y)
-    Z_pred_raw = numpy.array([
-        [best_func(xi, yi) for xi, yi in zip(rx, ry)]
-        for rx, ry in zip(X, Y)
-    ], dtype=float)
+    Z_real_raw = _evaluate_surface(target_function, X, Y)
+    Z_pred_raw = _evaluate_surface(best_func, X, Y)
 
     Z_real = _ensure_2d(Z_real_raw, X.shape)
     Z_pred = _ensure_2d(Z_pred_raw, X.shape)
@@ -639,7 +700,7 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
 
     for k, (title, Z, cmap) in enumerate(zip(titles, Z_list, cmaps)):
         ax = fig.add_subplot(1, 3, k + 1, projection="3d")
-        ax.plot_surface(X, Y, Z, cmap=cmap, edgecolor="none")
+        ax.plot_surface(X, Y, numpy.ma.masked_invalid(Z), cmap=cmap, edgecolor="none")
         ax.set_title(title, fontsize=11)
         ax.set_xlabel("x"); ax.set_ylabel("y"); ax.set_zlabel("z")
 
@@ -710,15 +771,10 @@ def save_results(hof, simplified_expr, metrics, log, output_dir,
     return path
 
 
-def run_experiment(target_expr=None, random_target=False, random_depth=3,
-                   seed=RANDOM_SEED, verbose=True, require_both=False,
+def run_experiment(target_expr=None, seed=RANDOM_SEED, verbose=True,
                    include_internal=False):
     """Ejecuta una corrida completa y devuelve todos los artefactos generados."""
     random.seed(seed)
-
-    if random_target or not target_expr:
-        target_expr = generate_random_target_expression(random_depth, require_both=require_both)
-
     set_target_expression(target_expr)
 
     output_dir = Path(__file__).resolve().parent
@@ -770,12 +826,12 @@ def run_experiment(target_expr=None, random_target=False, random_depth=3,
         "surf_path": surf_path,
         "tree_path": tree_path,
         "output_dir": output_dir,
+        "log": log,  # always include for the GUI evolution table
     }
 
     if include_internal:
         result.update({
             "pop": pop,
-            "log": log,
             "hof": hof,
             "best_per_gen": best_per_gen,
             "diversity_per_gen": diversity_per_gen,
@@ -784,71 +840,21 @@ def run_experiment(target_expr=None, random_target=False, random_depth=3,
     return result
 
 
-def format_experiment_summary(result):
-    """Devuelve un resumen legible para la GUI o la consola."""
-    lines = [
-        f"Función objetivo : {result['target_expr']}",
-        f"Población        : {result['population_size']}",
-        f"Generaciones     : {result['generations']}",
-        f"Parada anticipada: {'Sí' if result['early_stopped'] else 'No'}",
-        "",
-        "MEJOR INDIVIDUO",
-    ]
-
-    hof = result.get("hof")
-    if hof:
-        lines.extend([
-            f"Árbol       : {hof[0]}",
-            f"Nodos       : {len(hof[0])}",
-            f"Profundidad : {hof[0].height}",
-            f"Fitness     : {hof[0].fitness.values[0]:.6e}",
-        ])
-    else:
-        lines.extend([
-            f"Árbol       : (no incluido en esta salida)",
-            f"Fitness     : {result.get('fitness', 'n/a')}",
-        ])
-
-    if result["simplified_expr"] is not None:
-        lines.append(f"Expresión   : {result['simplified_expr']}")
-
-    if result["metrics"]:
-        lines.extend(["", "MÉTRICAS DE CALIDAD"])
-        for key, value in result["metrics"].items():
-            lines.append(f"  {key:6s}: {value:.6e}")
-
-    lines.extend([
-        "",
-        f"Resultados  : {result['results_path']}",
-        f"Evolución   : {result['evo_path']}",
-        f"Superficies : {result['surf_path']}",
-        f"Árbol       : {result['tree_path']}",
-    ])
-    return "\n".join(lines)
-
-
 if QT_AVAILABLE:
     class ExperimentWorker(QtCore.QObject):
         finished = QtCore.pyqtSignal(dict)
         failed = QtCore.pyqtSignal(str)
 
-        def __init__(self, target_expr, random_target, random_depth, require_both=False):
+        def __init__(self, target_expr):
             super().__init__()
             self.target_expr = target_expr
-            self.random_target = random_target
-            self.random_depth = random_depth
-            self.require_both = require_both
 
         @QtCore.pyqtSlot()
         def run(self):
             try:
                 result = run_experiment(
                     target_expr=self.target_expr,
-                    random_target=self.random_target,
-                    random_depth=self.random_depth,
                     verbose=True,
-                    require_both=self.require_both,
-                    include_internal=False,
                 )
             except Exception as exc:
                 self.failed.emit(str(exc))
@@ -932,20 +938,12 @@ if QT_AVAILABLE:
 
             title = QtWidgets.QLabel("Regresión simbólica")
             title.setStyleSheet("font-size: 24px; font-weight: 700;")
-            subtitle = QtWidgets.QLabel("Ingresa una función o genera una al azar y ejecuta la búsqueda.")
+            subtitle = QtWidgets.QLabel("Ingresa una función y ejecuta la aproximación.")
             subtitle.setWordWrap(True)
 
             self.expr_edit = QtWidgets.QLineEdit(TARGET_EXPR_STR)
             self.expr_edit.setPlaceholderText("Ejemplo: x**2 + y**2*x**2 + 1")
 
-            self.random_check = QtWidgets.QCheckBox("Usar función aleatoria")
-            self.random_depth = QtWidgets.QSpinBox()
-            self.random_depth.setRange(1, 6)
-            self.random_depth.setValue(3)
-            self.random_depth.setSuffix(" niveles")
-            self.require_both_cb = QtWidgets.QCheckBox("Forzar x y")
-
-            self.generate_button = QtWidgets.QPushButton("Generar función aleatoria")
             self.run_button = QtWidgets.QPushButton("Ejecutar aproximación")
             self.run_button.setMinimumHeight(44)
 
@@ -957,11 +955,6 @@ if QT_AVAILABLE:
             control_layout.addSpacing(12)
             control_layout.addWidget(QtWidgets.QLabel("Función objetivo"))
             control_layout.addWidget(self.expr_edit)
-            control_layout.addWidget(self.random_check)
-            control_layout.addWidget(self.require_both_cb)
-            control_layout.addWidget(QtWidgets.QLabel("Profundidad de la función aleatoria"))
-            control_layout.addWidget(self.random_depth)
-            control_layout.addWidget(self.generate_button)
             control_layout.addWidget(self.run_button)
             control_layout.addStretch(1)
             control_layout.addWidget(QtWidgets.QLabel("Estado"))
@@ -969,65 +962,227 @@ if QT_AVAILABLE:
 
             self.tabs = QtWidgets.QTabWidget()
 
+            # ── Sub-pestañas de Resumen ───────────────────────────
+            self.summary_tabs = QtWidgets.QTabWidget()
+
             self.summary_text = QtWidgets.QPlainTextEdit()
             self.summary_text.setReadOnly(True)
+            self.summary_text.setFont(QtGui.QFont("Courier New", 9))
+
+            self.evolution_table = QtWidgets.QTableWidget()
+            self.evolution_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.evolution_table.setAlternatingRowColors(True)
+            self.evolution_table.horizontalHeader().setStretchLastSection(True)
+            self.evolution_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.evolution_table.setSortingEnabled(True)
+
+            evo_table_desc = QtWidgets.QLabel(
+                "<b>Estadísticas por generación del algoritmo genético</b><br>"
+                "<b>Gen:</b> número de generación (0 = población inicial sin evolucionar).  "
+                "<b>Nevals:</b> individuos re-evaluados (solo los modificados por cruza/mutación).<br>"
+                "<b>Depth avg/min/max/std:</b> profundidad de los árboles. Creciente = posible bloat; muy baja = expresiones simples sin convergencia.<br>"
+                "<b>Fitness avg/min/max/std:</b> distribución del fitness (MSE + penalización por complejidad). El mínimo es el mejor individuo de esa generación.<br>"
+                "<b>Size avg/min/max/std:</b> nodos por árbol. COMPLEXITY_WEIGHT controla su crecimiento para evitar inflación de código.<br>"
+                "Haz clic en cualquier encabezado de columna para ordenar."
+            )
+            evo_table_desc.setWordWrap(True)
+            evo_table_desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            evo_table_desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
+
+            evo_table_widget = QtWidgets.QWidget()
+            evo_table_layout = QtWidgets.QVBoxLayout(evo_table_widget)
+            evo_table_layout.setContentsMargins(0, 0, 0, 0)
+            evo_table_layout.addWidget(evo_table_desc)
+            evo_table_layout.addWidget(self.evolution_table, 1)
+
+            self.summary_tabs.addTab(self.summary_text, "📄 Reporte")
+            self.summary_tabs.addTab(evo_table_widget, "📈 Evolución")
 
             self.metrics_text = QtWidgets.QPlainTextEdit()
             self.metrics_text.setReadOnly(True)
 
+            metrics_desc = QtWidgets.QLabel(
+                "<b>Métricas de calidad del mejor individuo encontrado</b><br>"
+                "<b>MSE</b> (Error Cuadrático Medio): promedio de los errores al cuadrado entre la función objetivo y la aproximación. "
+                "Penaliza fuertemente errores grandes. Cuanto más cercano a 0, mejor.<br>"
+                "<b>RMSE</b> (Raíz del MSE): misma unidad que la función. Más interpretable que el MSE directamente.<br>"
+                "<b>MAE</b> (Error Absoluto Medio): promedio de los errores absolutos. Menos sensible a outliers que el MSE.<br>"
+                "<b>R²</b> (Coeficiente de determinación): fracción de la varianza de la función objetivo explicada por la aproximación. "
+                "R²=1.0 es ajuste perfecto; R²=0.0 equivale a predecir siempre la media; valores negativos indican un ajuste peor que la media."
+            )
+            metrics_desc.setWordWrap(True)
+            metrics_desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            metrics_desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
+
+            metrics_widget = QtWidgets.QWidget()
+            metrics_layout = QtWidgets.QVBoxLayout(metrics_widget)
+            metrics_layout.setContentsMargins(0, 0, 0, 0)
+            metrics_layout.addWidget(metrics_desc)
+            metrics_layout.addWidget(self.metrics_text)
+
             self.plots_tabs = QtWidgets.QTabWidget()
+
+            def _plot_tab(view_widget, title_html):
+                w = QtWidgets.QWidget()
+                vl = QtWidgets.QVBoxLayout(w)
+                vl.setContentsMargins(0, 0, 0, 0)
+                desc = QtWidgets.QLabel(title_html)
+                desc.setWordWrap(True)
+                desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+                desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
+                vl.addWidget(desc)
+                vl.addWidget(view_widget, 1)
+                return w
+
             self.evolution_view = PlotImageView()
-            self.surface_view = PlotImageView()
-            self.tree_view = PlotImageView()
+            self.surface_view   = PlotImageView()
+            self.tree_view      = PlotImageView()
 
-            self.plots_tabs.addTab(self.evolution_view, "Evolución")
-            self.plots_tabs.addTab(self.surface_view, "Superficies")
-            self.plots_tabs.addTab(self.tree_view, "Árbol")
+            evo_desc = (
+                "<b>Gráfica de evolución del algoritmo genético (6 paneles)</b><br>"
+                "<b>① MSE mínimo y promedio (log):</b> muestra cómo cae el error en la población a lo largo de las generaciones. "
+                "Una caída rápida indica buena convergencia; si el mínimo baja pero el promedio no, la población ha perdido diversidad.<br>"
+                "<b>② Fitness del mejor individuo (log):</b> trayectoria del campeón del Hall of Fame. "
+                "La línea roja punteada marca el umbral de parada anticipada.<br>"
+                "<b>③ Diversidad genética:</b> fracción de árboles únicos en la población. "
+                "Valores bajos (&lt;0.2) indican convergencia prematura o pérdida de diversidad.<br>"
+                "<b>④ Complejidad — nodos por árbol:</b> si el tamaño promedio crece sin control se produce 'bloat' (inflación de código). "
+                "El parámetro COMPLEXITY_WEIGHT penaliza esto.<br>"
+                "<b>⑤ Profundidad de los árboles:</b> una profundidad creciente aumenta el espacio de búsqueda pero también el tiempo de evaluación.<br>"
+                "<b>⑥ Tamaño del mejor individuo:</b> si el campeón crece mucho sin mejorar el error, la solución es probablemente redundante."
+            )
+            surf_desc = (
+                "<b>Comparación de superficies 3D en la cuadrícula [-1, 1] × [-1, 1]</b><br>"
+                "<b>Izquierda — Función objetivo:</b> la superficie real f(x,y) que el algoritmo intenta aproximar.<br>"
+                "<b>Centro — Mejor aproximación DEAP:</b> la expresión simbólica encontrada por el algoritmo genético. "
+                "Idealmente debe tener la misma forma que la función objetivo.<br>"
+                "<b>Derecha — Error absoluto |f − f̂|:</b> diferencia punto a punto entre ambas superficies. "
+                "Zonas rojas/claras indican regiones donde la aproximación es menos precisa. "
+                "Un error uniformemente bajo y plano es señal de un buen ajuste global."
+            )
+            tree_desc = (
+                "<b>Árbol de expresión del mejor individuo (representación interna del árbol GP)</b><br>"
+                "Cada nodo cuadrado representa una operación o terminal. "
+                "<span style='color:#5dade2;'>■ Azul</span> = operador matemático (add, mul, sin, …)  "
+                "<span style='color:#2ecc71;'>■ Verde claro</span> = variable (x, y)  "
+                "<span style='color:#27ae60;'>■ Verde oscuro</span> = constante numérica.<br>"
+                "La raíz del árbol es el nodo superior; los hijos son los argumentos de cada operador. "
+                "Árboles más profundos representan expresiones más complejas. "
+                "Si el árbol es muy grande comparado con su R², probablemente contiene subárboles redundantes "
+                "(p.ej. x - x, o * 1.0) que SymPy eliminaría al simplificar."
+            )
 
-            self.tabs.addTab(self.summary_text, "Resumen")
-            self.tabs.addTab(self.metrics_text, "Métricas")
+            self.plots_tabs.addTab(_plot_tab(self.evolution_view, evo_desc),  "Evolución")
+            self.plots_tabs.addTab(_plot_tab(self.surface_view,   surf_desc), "Superficies")
+            self.plots_tabs.addTab(_plot_tab(self.tree_view,      tree_desc), "Árbol")
+
+            self.tabs.addTab(self.summary_tabs, "Resumen")
+            self.tabs.addTab(metrics_widget, "Métricas")
             self.tabs.addTab(self.plots_tabs, "Gráficas")
+
+            # ── Pestaña de Ayuda ─────────────────────────────────
+            help_scroll = QtWidgets.QScrollArea()
+            help_scroll.setWidgetResizable(True)
+            help_content = QtWidgets.QWidget()
+            help_layout = QtWidgets.QVBoxLayout(help_content)
+            help_layout.setContentsMargins(20, 20, 20, 20)
+            help_layout.setSpacing(12)
+
+            help_text = QtWidgets.QLabel()
+            help_text.setWordWrap(True)
+            help_text.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            help_text.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
+            help_text.setText("""
+<h2 style="color:#60a5fa;">Regresión Simbólica con DEAP — Guía de uso</h2>
+
+<h3 style="color:#34d399;">¿Qué hace esta aplicación?</h3>
+<p>Utiliza <b>programación genética</b> para encontrar automáticamente una expresión matemática
+que aproxime la función objetivo que tú defines. El algoritmo evoluciona una población de
+árboles de expresión durante múltiples generaciones hasta hallar la mejor aproximación posible.</p>
+
+<hr/>
+<h3 style="color:#34d399;">Cómo usar la interfaz</h3>
+<ol>
+  <li><b>Escribe una función objetivo</b> en el campo de texto (por ejemplo: <code>x**2 + y</code>).</li>
+  <li>Haz clic en <b>"Ejecutar aproximación"</b> para iniciar la evolución.</li>
+  <li>Espera a que termine (puede tardar varios minutos según tu hardware).</li>
+  <li>Consulta los resultados en las pestañas: <b>Resumen, Métricas y Gráficas</b>.</li>
+</ol>
+
+<hr/>
+<h3 style="color:#34d399;">Cómo escribir funciones matemáticas</h3>
+<p>Las funciones usan las variables <b>x</b> e <b>y</b>. La sintaxis es Python/SymPy:</p>
+
+<table border="0" cellspacing="6" cellpadding="4">
+  <tr><th align="left" style="color:#fbbf24;">Operación</th><th align="left" style="color:#fbbf24;">Sintaxis</th><th align="left" style="color:#fbbf24;">Ejemplo</th></tr>
+  <tr><td>Suma</td><td><code>+</code></td><td><code>x + y</code></td></tr>
+  <tr><td>Resta</td><td><code>-</code></td><td><code>x - y</code></td></tr>
+  <tr><td>Multiplicación</td><td><code>*</code></td><td><code>x * y</code></td></tr>
+  <tr><td>División</td><td><code>/</code></td><td><code>x / y</code></td></tr>
+  <tr><td>Potencia</td><td><code>**</code></td><td><code>x**2</code>, <code>x**0.5</code></td></tr>
+  <tr><td>Seno</td><td><code>sin(...)</code></td><td><code>sin(x)</code></td></tr>
+  <tr><td>Coseno</td><td><code>cos(...)</code></td><td><code>cos(y)</code></td></tr>
+  <tr><td>Raíz cuadrada</td><td><code>sqrt(...)</code></td><td><code>sqrt(x**2 + y**2)</code></td></tr>
+  <tr><td>Logaritmo natural</td><td><code>log(...)</code></td><td><code>log(Abs(x) + 1)</code></td></tr>
+  <tr><td>Exponencial</td><td><code>exp(...)</code></td><td><code>exp(x)</code></td></tr>
+  <tr><td>Valor absoluto</td><td><code>Abs(...)</code></td><td><code>Abs(x - y)</code></td></tr>
+  <tr><td>Constante pi</td><td><code>pi</code></td><td><code>sin(pi * x)</code></td></tr>
+</table>
+
+<h3 style="color:#f87171;">Consejos y advertencias</h3>
+<ul>
+  <li>Evita divisiones sin protección: usa <code>Abs(y) + 1</code> en el denominador.</li>
+  <li>Evita <code>log</code> o <code>sqrt</code> de valores negativos; usa <code>Abs(...)</code> dentro.</li>
+  <li>Las funciones muy complejas o con valores extremos pueden resultar en errores de evaluación.</li>
+  <li>La función se evalúa en la cuadrícula <b>[-5, 5] × [-5, 5]</b> con paso 0.1.</li>
+</ul>
+
+<h3 style="color:#34d399;">Pestañas de resultados</h3>
+<ul>
+  <li><b>Resumen:</b> contenido completo del archivo TXT generado con todos los parámetros, el mejor individuo encontrado, métricas de calidad y la evolución generación por generación.</li>
+  <li><b>Métricas:</b> MSE, RMSE, MAE y R² del mejor individuo encontrado.</li>
+  <li><b>Gráficas → Evolución:</b> curva del fitness mínimo y tamaño de árbol por generación.</li>
+  <li><b>Gráficas → Superficies:</b> comparación 3D de la función objetivo vs. la aproximada.</li>
+  <li><b>Gráficas → Árbol:</b> visualización del árbol de expresión del mejor individuo.</li>
+</ul>
+
+<h3 style="color:#34d399;">Archivos generados</h3>
+<p>Todos los archivos se guardan en la misma carpeta que el script:</p>
+<ul>
+  <li><code>resultados_YYYYMMDD_HHMMSS.txt</code> — reporte completo de texto</li>
+  <li><code>evolucion_estadisticas.png</code> — gráfica de evolución</li>
+  <li><code>superficies_deap.png</code> — gráfica de superficies</li>
+  <li><code>arbol_expresion.png</code> — árbol de la expresión encontrada</li>
+</ul>
+""")
+            help_layout.addWidget(help_text)
+            help_layout.addStretch(1)
+            help_scroll.setWidget(help_content)
+            self.tabs.addTab(help_scroll, "Ayuda")
 
             root_layout.addWidget(controls, 0)
             root_layout.addWidget(self.tabs, 1)
 
-            self.generate_button.clicked.connect(self._generate_random_expression)
             self.run_button.clicked.connect(self._run_experiment)
-
-        def _generate_random_expression(self):
-            expr = generate_random_target_expression(self.random_depth.value(), require_both=self.require_both_cb.isChecked())
-            self.expr_edit.setText(expr)
-            self.random_check.setChecked(True)
-            self.status_label.setText(f"Función aleatoria generada: {expr}")
 
         def _set_running(self, running: bool):
             self.run_button.setEnabled(not running)
-            self.generate_button.setEnabled(not running)
             self.expr_edit.setEnabled(not running)
-            self.random_check.setEnabled(not running)
-            self.random_depth.setEnabled(not running)
 
         def _run_experiment(self):
             target_expr = self.expr_edit.text().strip()
-            use_random = self.random_check.isChecked()
-            if use_random:
-                # If the user already generated a function (expr_edit non-empty), use it.
-                # Only generate a new random function if the field is empty.
-                if not target_expr:
-                    target_expr = generate_random_target_expression(
-                        self.random_depth.value(), require_both=self.require_both_cb.isChecked()
-                    )
-                    self.expr_edit.setText(target_expr)
-            elif not target_expr:
+            if not target_expr:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Función requerida",
-                    "Ingresa una función válida o activa 'Usar función aleatoria'.",
+                    "Ingresa una función válida o usa 'Generar función aleatoria'.",
                 )
                 return
 
             self.summary_text.setPlainText("")
             self.metrics_text.setPlainText("")
+            self.evolution_table.clearContents()
+            self.evolution_table.setRowCount(0)
             self.evolution_view.clear_image()
             self.surface_view.clear_image()
             self.tree_view.clear_image()
@@ -1036,13 +1191,7 @@ if QT_AVAILABLE:
             self.status_label.setText("Ejecutando evolución... esto puede tardar unos minutos.")
 
             self._thread = QtCore.QThread(self)
-            # Pass the exact expression to the worker; do not request the worker to generate another random.
-            self._worker = ExperimentWorker(
-                target_expr,
-                False,
-                self.random_depth.value(),
-                require_both=self.require_both_cb.isChecked(),
-            )
+            self._worker = ExperimentWorker(target_expr)
             self._worker.moveToThread(self._thread)
             self._thread.started.connect(self._worker.run)
             self._worker.finished.connect(self._on_finished)
@@ -1058,8 +1207,82 @@ if QT_AVAILABLE:
             self._set_running(False)
             self.status_label.setText("Ejecución terminada.")
 
-            summary_text = format_experiment_summary(result)
+            # ── Pestaña Reporte: contenido completo del TXT ──────
+            results_path = result.get("results_path")
+            try:
+                with open(results_path, "r", encoding="utf-8") as f:
+                    summary_text = f.read()
+            except Exception as e:
+                summary_text = f"No se pudo leer el archivo de resultados:\n{results_path}\n\n{e}"
             self.summary_text.setPlainText(summary_text)
+
+            # ── Pestaña Evolución: tabla de generaciones ──────────
+            log = result.get("log")
+            if log is not None:
+                try:
+                    chapters = log.chapters
+                    gens    = log.select("gen")
+                    nevals  = log.select("nevals")
+                    # depth chapter
+                    d_avg = chapters["depth"].select("avg")
+                    d_min = chapters["depth"].select("min")
+                    d_max = chapters["depth"].select("max")
+                    d_std = chapters["depth"].select("std")
+                    # fitness chapter
+                    f_avg = chapters["fitness"].select("avg")
+                    f_min = chapters["fitness"].select("min")
+                    f_max = chapters["fitness"].select("max")
+                    f_std = chapters["fitness"].select("std")
+                    # size chapter
+                    s_avg = chapters["size"].select("avg")
+                    s_min = chapters["size"].select("min")
+                    s_max = chapters["size"].select("max")
+                    s_std = chapters["size"].select("std")
+
+                    columns = [
+                        "Gen", "Nevals",
+                        "Depth avg", "Depth min", "Depth max", "Depth std",
+                        "Fitness avg", "Fitness min", "Fitness max", "Fitness std",
+                        "Size avg", "Size min", "Size max", "Size std",
+                    ]
+                    self.evolution_table.setSortingEnabled(False)
+                    self.evolution_table.setColumnCount(len(columns))
+                    self.evolution_table.setHorizontalHeaderLabels(columns)
+                    self.evolution_table.setRowCount(len(gens))
+
+                    def _item(val, is_sci=False):
+                        try:
+                            fval = float(val)
+                            text = f"{fval:.4e}" if is_sci else f"{fval:.4f}"
+                        except Exception:
+                            text = str(val)
+                        item = QtWidgets.QTableWidgetItem(text)
+                        item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+                        return item
+
+                    for row, g in enumerate(gens):
+                        self.evolution_table.setItem(row, 0,  _item(g))
+                        self.evolution_table.setItem(row, 1,  _item(nevals[row]))
+                        self.evolution_table.setItem(row, 2,  _item(d_avg[row]))
+                        self.evolution_table.setItem(row, 3,  _item(d_min[row]))
+                        self.evolution_table.setItem(row, 4,  _item(d_max[row]))
+                        self.evolution_table.setItem(row, 5,  _item(d_std[row]))
+                        self.evolution_table.setItem(row, 6,  _item(f_avg[row], True))
+                        self.evolution_table.setItem(row, 7,  _item(f_min[row], True))
+                        self.evolution_table.setItem(row, 8,  _item(f_max[row], True))
+                        self.evolution_table.setItem(row, 9,  _item(f_std[row], True))
+                        self.evolution_table.setItem(row, 10, _item(s_avg[row]))
+                        self.evolution_table.setItem(row, 11, _item(s_min[row]))
+                        self.evolution_table.setItem(row, 12, _item(s_max[row]))
+                        self.evolution_table.setItem(row, 13, _item(s_std[row]))
+
+                    self.evolution_table.resizeColumnsToContents()
+                    self.evolution_table.setSortingEnabled(True)
+                except Exception as exc:
+                    self.evolution_table.setRowCount(1)
+                    self.evolution_table.setColumnCount(1)
+                    self.evolution_table.setHorizontalHeaderLabels(["Error"])
+                    self.evolution_table.setItem(0, 0, QtWidgets.QTableWidgetItem(str(exc)))
 
             metrics = result["metrics"] or {}
             if metrics:
@@ -1079,27 +1302,10 @@ if QT_AVAILABLE:
             QtWidgets.QMessageBox.critical(self, "Error", message)
 
 
-def run_cli():
-    result = run_experiment(target_expr=TARGET_EXPR_STR, random_target=False, verbose=True)
-    print(f"\n{'═'*60}")
-    print("MEJOR INDIVIDUO")
-    print(f"{'═'*60}")
-    print(format_experiment_summary(result))
-    return result
-
-
-# ══════════════════════════════════════════════════════════════
-# SECCIÓN 12 — MAIN
-# ══════════════════════════════════════════════════════════════
-
-def main():
-    return run_experiment(target_expr=TARGET_EXPR_STR, random_target=False, verbose=True)
-
-
 if __name__ == "__main__":
     if QT_AVAILABLE and "--cli" not in sys.argv:
         app = QtWidgets.QApplication(sys.argv)
         window = MainWindow()
         window.show()
         sys.exit(app.exec())
-    run_cli()
+    run_experiment(target_expr=TARGET_EXPR_STR, verbose=True)
