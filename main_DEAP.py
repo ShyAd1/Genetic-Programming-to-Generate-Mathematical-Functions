@@ -791,8 +791,12 @@ def save_results(hof, simplified_expr, metrics, log, output_dir,
     cw       = cw       if cw       is not None else COMPLEXITY_WEIGHT
     es       = es       if es       is not None else EARLY_STOP_THRESHOLD
 
+    # Crear carpeta de Resultados con timestamp para evitar sobreescrituras
+    output_dir = output_dir / "Resultados"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = output_dir / "Resultados" / f"resultados_{timestamp}.txt"
+    path = output_dir / f"resultados_{timestamp}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
 
     gens     = log.select("gen")
