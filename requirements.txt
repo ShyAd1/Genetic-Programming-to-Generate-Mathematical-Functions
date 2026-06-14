@@ -1,0 +1,14 @@
+# Requerimientos principales para main_DEAP.py
+
+numpy>=1.24.0
+matplotlib>=3.7.0
+sympy>=1.12
+networkx>=3.1
+deap>=1.4.1
+
+# GUI (opcional pero recomendada)
+PyQt6>=6.5.0
+
+# Opcionales / para mejor rendimiento
+scipy>=1.10.0          # recomendado para SymPy y estabilidad numérica
+pandas>=2.0.0          # útil para análisis adicionales

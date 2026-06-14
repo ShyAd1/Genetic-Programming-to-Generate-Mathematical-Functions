@@ -61,7 +61,7 @@ _EVAL_Y = np.array([y / 10.0 for x in EVAL_RANGE for y in EVAL_RANGE])
 _TARGET_VALUES = None  # se inicializa al cargar la función objetivo
 
 # Semilla para reproducibilidad
-RANDOM_SEED          = random.randint(0, 100000)
+RANDOM_SEED          = 42 # random.randint(0, 100000)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1038,6 +1038,7 @@ if QT_AVAILABLE:
 
             controls = QtWidgets.QFrame()
             controls.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+            controls.setFont(QtGui.QFont("Segoe UI", 15))
             controls.setMinimumWidth(360)
             control_layout = QtWidgets.QVBoxLayout(controls)
 
@@ -1058,12 +1059,13 @@ if QT_AVAILABLE:
             # ── Parámetros del algoritmo ──────────────────────────
             params_group = QtWidgets.QGroupBox("Parámetros del algoritmo")
             params_group.setStyleSheet(
-                "QGroupBox { font-weight: 600; border: 1px solid #374151; border-radius: 6px; margin-top: 8px; padding-top: 6px; }"
+                "QGroupBox { font-weight: 600; border: 1px solid #374151; border-radius: 6px; margin-top: 20px; padding-top: 6px; }"
                 "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
             )
+            params_group.setFont(QtGui.QFont("Segoe UI", 15))
             params_form = QtWidgets.QFormLayout(params_group)
             params_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            params_form.setSpacing(6)
+            params_form.setSpacing(12)
 
             def _spin_int(value, lo, hi, step=1, tooltip=""):
                 w = QtWidgets.QSpinBox()
@@ -1139,7 +1141,23 @@ if QT_AVAILABLE:
 
             self.summary_text = QtWidgets.QPlainTextEdit()
             self.summary_text.setReadOnly(True)
-            self.summary_text.setFont(QtGui.QFont("Courier New", 9))
+            self.summary_text.setFont(QtGui.QFont("Courier New", 15))
+
+            sumary_text_desc = QtWidgets.QLabel(
+                "<b>Reporte detallado de la ejecución</b><br>"
+                "Incluye el mejor individuo encontrado, su expresión simbólica simplificada, métricas de calidad y un resumen de la evolución por generación.<br>"
+                "Consulta la pestaña 'Evolución' para estadísticas detalladas por generación."
+            )
+            sumary_text_desc.setWordWrap(True)
+            sumary_text_desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            sumary_text_desc.setFont(QtGui.QFont("Arial", 15))
+            sumary_text_desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
+
+            summary_text_widget = QtWidgets.QWidget()
+            summary_text_layout = QtWidgets.QVBoxLayout(summary_text_widget)
+            summary_text_layout.setContentsMargins(0, 0, 0, 0)
+            summary_text_layout.addWidget(sumary_text_desc)
+            summary_text_layout.addWidget(self.summary_text, 1)
 
             self.evolution_table = QtWidgets.QTableWidget()
             self.evolution_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -1159,6 +1177,7 @@ if QT_AVAILABLE:
             )
             evo_table_desc.setWordWrap(True)
             evo_table_desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            evo_table_desc.setFont(QtGui.QFont("Arial", 15))
             evo_table_desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
 
             evo_table_widget = QtWidgets.QWidget()
@@ -1167,11 +1186,12 @@ if QT_AVAILABLE:
             evo_table_layout.addWidget(evo_table_desc)
             evo_table_layout.addWidget(self.evolution_table, 1)
 
-            self.summary_tabs.addTab(self.summary_text, "Reporte")
+            self.summary_tabs.addTab(summary_text_widget, "Reporte")
             self.summary_tabs.addTab(evo_table_widget, "Evolución")
 
             self.metrics_text = QtWidgets.QPlainTextEdit()
             self.metrics_text.setReadOnly(True)
+            self.metrics_text.setFont(QtGui.QFont("Courier New", 15))
 
             metrics_desc = QtWidgets.QLabel(
                 "<b>Métricas de calidad del mejor individuo encontrado</b><br>"
@@ -1184,6 +1204,7 @@ if QT_AVAILABLE:
             )
             metrics_desc.setWordWrap(True)
             metrics_desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            metrics_desc.setFont(QtGui.QFont("Arial", 15))
             metrics_desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
 
             metrics_widget = QtWidgets.QWidget()
@@ -1201,6 +1222,7 @@ if QT_AVAILABLE:
                 desc = QtWidgets.QLabel(title_html)
                 desc.setWordWrap(True)
                 desc.setTextFormat(QtCore.Qt.TextFormat.RichText)
+                desc.setFont(QtGui.QFont("Arial", 15))
                 desc.setStyleSheet("padding: 8px; background: #1e293b; border-radius: 4px; color: #cbd5e1;")
                 vl.addWidget(desc)
                 vl.addWidget(view_widget, 1)
@@ -1263,6 +1285,7 @@ if QT_AVAILABLE:
             help_text = QtWidgets.QLabel()
             help_text.setWordWrap(True)
             help_text.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            help_text.setFont(QtGui.QFont("Arial", 13))
             help_text.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
             help_text.setText("""
 <h2 style="color:#60a5fa;">Regresión Simbólica con DEAP — Guía de uso</h2>
