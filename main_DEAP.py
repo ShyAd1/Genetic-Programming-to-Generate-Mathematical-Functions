@@ -61,7 +61,7 @@ _EVAL_Y = np.array([y / 10.0 for x in EVAL_RANGE for y in EVAL_RANGE])
 _TARGET_VALUES = None  # se inicializa al cargar la función objetivo
 
 # Semilla para reproducibilidad
-RANDOM_SEED          = random.randint(0, 10000)
+RANDOM_SEED          = random.randint(0, 100000)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -166,6 +166,17 @@ def np_sin(x):
 def np_cos(x):
     return np.cos(x)
 
+def protectedPow(base, exponent):
+    try:
+        result = base ** exponent
+        if isinstance(result, complex) or math.isnan(result) or math.isinf(result):
+            return 1.0
+        # Evitar overflow
+        if abs(result) > 1e6:
+            return 1e6 if result > 0 else -1e6
+        return result
+    except (OverflowError, ZeroDivisionError, ValueError):
+        return 1.0
 
 # ══════════════════════════════════════════════════════════════
 # SECCIÓN 4 — PRIMITIVOS Y CREADORES DEAP
@@ -184,6 +195,7 @@ pset.addPrimitive(np_neg,        1)
 pset.addPrimitive(np_sin,        1)
 pset.addPrimitive(np_cos,        1)
 pset.addPrimitive(protectedSqrt, 1)
+pset.addPrimitive(protectedPow, 2)
 pset.addPrimitive(protectedLog,  1)
 pset.addPrimitive(protectedExp,  1)
 pset.addPrimitive(protectedAbs,  1)
@@ -770,8 +782,15 @@ def show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir):
 # ══════════════════════════════════════════════════════════════
 
 def save_results(hof, simplified_expr, metrics, log, output_dir,
-                 early_stopped, best_per_gen):
+                 early_stopped, best_per_gen, pop_size=None, n_gen=None, cxpb=None, mutpb=None, cw=None, es=None):
     """Escribe un resumen completo de la ejecución en un archivo .txt."""
+    pop_size = pop_size if pop_size is not None else POPULATION_SIZE
+    n_gen    = n_gen    if n_gen    is not None else N_GENERATIONS
+    cxpb     = cxpb     if cxpb     is not None else CROSSOVER_PROB
+    mutpb    = mutpb    if mutpb    is not None else MUTATION_PROB
+    cw       = cw       if cw       is not None else COMPLEXITY_WEIGHT
+    es       = es       if es       is not None else EARLY_STOP_THRESHOLD
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = output_dir / "Resultados" / f"resultados_{timestamp}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -790,12 +809,12 @@ def save_results(hof, simplified_expr, metrics, log, output_dir,
         f.write(f"{sep}\n\n")
 
         f.write(f"Función objetivo : {TARGET_EXPR_STR}\n")
-        f.write(f"Población        : {POPULATION_SIZE}\n")
-        f.write(f"Generaciones     : {N_GENERATIONS}\n")
-        f.write(f"P(cruza)         : {CROSSOVER_PROB}\n")
-        f.write(f"P(mutación)      : {MUTATION_PROB}\n")
-        f.write(f"Peso complejidad : {COMPLEXITY_WEIGHT}\n")
-        f.write(f"Umbral parada    : {EARLY_STOP_THRESHOLD}\n")
+        f.write(f"Población        : {pop_size}\n")
+        f.write(f"Generaciones     : {n_gen}\n")
+        f.write(f"P(cruza)         : {cxpb}\n")
+        f.write(f"P(mutación)      : {mutpb}\n")
+        f.write(f"Peso complejidad : {cw}\n")
+        f.write(f"Umbral parada    : {es}\n")
         f.write(f"Parada anticipada: {'Sí' if early_stopped else 'No'}\n\n")
 
         f.write(f"{dash}\nMEJOR INDIVIDUO\n{dash}\n")
@@ -823,13 +842,36 @@ def save_results(hof, simplified_expr, metrics, log, output_dir,
 
 
 def run_experiment(target_expr=None, seed=RANDOM_SEED, verbose=True,
-                   include_internal=False):
+                   include_internal=False,
+                   population_size=None, n_generations=None,
+                   crossover_prob=None, mutation_prob=None,
+                   complexity_weight=None, early_stop_threshold=None,
+                   tree_min_depth=None, tree_max_depth=None, tree_height_limit=None):
     """Ejecuta una corrida completa y devuelve todos los artefactos generados."""
+    global COMPLEXITY_WEIGHT, EARLY_STOP_THRESHOLD, TREE_HEIGHT_LIMIT
+
+    # Allow overriding global parameters per-run
+    _pop_size     = population_size      if population_size      is not None else POPULATION_SIZE
+    _n_gen        = n_generations        if n_generations        is not None else N_GENERATIONS
+    _cxpb         = crossover_prob       if crossover_prob       is not None else CROSSOVER_PROB
+    _mutpb        = mutation_prob        if mutation_prob        is not None else MUTATION_PROB
+    _cw           = complexity_weight    if complexity_weight    is not None else COMPLEXITY_WEIGHT
+    _es           = early_stop_threshold if early_stop_threshold is not None else EARLY_STOP_THRESHOLD
+    _min_d        = tree_min_depth       if tree_min_depth       is not None else TREE_MIN_DEPTH
+    _max_d        = tree_max_depth       if tree_max_depth       is not None else TREE_MAX_DEPTH
+    _hlim         = tree_height_limit    if tree_height_limit    is not None else TREE_HEIGHT_LIMIT
+
+    # Patch globals used inside evalSymbReg / run_evolution for this run
+    _orig_cw, _orig_es, _orig_hl = COMPLEXITY_WEIGHT, EARLY_STOP_THRESHOLD, TREE_HEIGHT_LIMIT
+    COMPLEXITY_WEIGHT    = _cw
+    EARLY_STOP_THRESHOLD = _es
+    TREE_HEIGHT_LIMIT    = _hlim
+
     random.seed(seed)
     set_target_expression(target_expr)
 
     output_dir = Path(__file__).resolve().parent
-    pop = toolbox.population(n=POPULATION_SIZE)
+    pop = toolbox.population(n=_pop_size)
     hof = tools.HallOfFame(1)
 
     stats_fit = tools.Statistics(lambda ind: ind.fitness.values)
@@ -848,27 +890,33 @@ def run_experiment(target_expr=None, seed=RANDOM_SEED, verbose=True,
 
     pop, log, best_per_gen, diversity_per_gen, early_stopped = run_evolution(
         pop, toolbox,
-        cxpb=CROSSOVER_PROB,
-        mutpb=MUTATION_PROB,
-        ngen=N_GENERATIONS,
+        cxpb=_cxpb,
+        mutpb=_mutpb,
+        ngen=_n_gen,
         stats=mstats,
         halloffame=hof,
         verbose=verbose,
     )
+
+    # Restore globals after run
+    COMPLEXITY_WEIGHT    = _orig_cw
+    EARLY_STOP_THRESHOLD = _orig_es
+    TREE_HEIGHT_LIMIT    = _orig_hl
 
     simplified_expr = simplify_best_individual(hof[0])
     metrics = compute_metrics(hof[0], EVAL_POINTS)
     results_path = save_results(
         hof, simplified_expr, metrics, log,
         output_dir, early_stopped, best_per_gen,
+        pop_size=_pop_size, n_gen=_n_gen, cxpb=_cxpb, mutpb=_mutpb, cw=_cw, es=_es
     )
     evo_path, surf_path = show_plots(log, hof, best_per_gen, diversity_per_gen, output_dir)
     tree_path = plot_expression_tree(hof[0], output_dir)
 
     result = {
         "target_expr": target_expr,
-        "population_size": POPULATION_SIZE,
-        "generations": N_GENERATIONS,
+        "population_size": _pop_size,
+        "generations": _n_gen,
         "early_stopped": early_stopped,
         "simplified_expr": simplified_expr,
         "metrics": metrics,
@@ -896,9 +944,10 @@ if QT_AVAILABLE:
         finished = QtCore.pyqtSignal(dict)
         failed = QtCore.pyqtSignal(str)
 
-        def __init__(self, target_expr):
+        def __init__(self, target_expr, params=None):
             super().__init__()
             self.target_expr = target_expr
+            self.params = params or {}
 
         @QtCore.pyqtSlot()
         def run(self):
@@ -906,6 +955,7 @@ if QT_AVAILABLE:
                 result = run_experiment(
                     target_expr=self.target_expr,
                     verbose=True,
+                    **self.params,
                 )
             except Exception as exc:
                 self.failed.emit(str(exc))
@@ -1001,11 +1051,78 @@ if QT_AVAILABLE:
             self.status_label = QtWidgets.QLabel("Listo.")
             self.status_label.setWordWrap(True)
 
+            # ── Parámetros del algoritmo ──────────────────────────
+            params_group = QtWidgets.QGroupBox("Parámetros del algoritmo")
+            params_group.setStyleSheet(
+                "QGroupBox { font-weight: 600; border: 1px solid #374151; border-radius: 6px; margin-top: 8px; padding-top: 6px; }"
+                "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
+            )
+            params_form = QtWidgets.QFormLayout(params_group)
+            params_form.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+            params_form.setSpacing(6)
+
+            def _spin_int(value, lo, hi, step=1, tooltip=""):
+                w = QtWidgets.QSpinBox()
+                w.setRange(lo, hi)
+                w.setValue(value)
+                w.setSingleStep(step)
+                if tooltip:
+                    w.setToolTip(tooltip)
+                return w
+
+            def _spin_float(value, lo, hi, step=0.01, decimals=2, tooltip=""):
+                w = QtWidgets.QDoubleSpinBox()
+                w.setRange(lo, hi)
+                w.setValue(value)
+                w.setSingleStep(step)
+                w.setDecimals(decimals)
+                if tooltip:
+                    w.setToolTip(tooltip)
+                return w
+
+            self.spin_pop   = _spin_int(POPULATION_SIZE,   10,  5000, 10,
+                tooltip="Número de individuos en la población.")
+            self.spin_ngen  = _spin_int(N_GENERATIONS,      1,  2000,  1,
+                tooltip="Número máximo de generaciones.")
+            self.spin_cxpb  = _spin_float(CROSSOVER_PROB,  0.0, 1.0,  0.05, 2,
+                tooltip="Probabilidad de cruzamiento (0–1).")
+            self.spin_mutpb = _spin_float(MUTATION_PROB,   0.0, 1.0,  0.05, 2,
+                tooltip="Probabilidad de mutación (0–1).")
+            self.spin_cw    = _spin_float(COMPLEXITY_WEIGHT, 0.0, 10.0, 0.001, 4,
+                tooltip="Penalización por tamaño del árbol.")
+            self.spin_es    = _spin_float(EARLY_STOP_THRESHOLD, 0.0, 1.0, 0.0001, 6,
+                tooltip="Umbral de parada anticipada (MSE).")
+            self.spin_mind  = _spin_int(TREE_MIN_DEPTH,    1,  10, 1,
+                tooltip="Profundidad mínima del árbol inicial.")
+            self.spin_maxd  = _spin_int(TREE_MAX_DEPTH,    1,  20, 1,
+                tooltip="Profundidad máxima del árbol inicial.")
+            self.spin_hlim  = _spin_int(TREE_HEIGHT_LIMIT, 1,  30, 1,
+                tooltip="Límite duro de profundidad durante la evolución.")
+
+            params_form.addRow("Tamaño población:",      self.spin_pop)
+            params_form.addRow("Generaciones:",          self.spin_ngen)
+            params_form.addRow("P. cruzamiento:",        self.spin_cxpb)
+            params_form.addRow("P. mutación:",           self.spin_mutpb)
+            params_form.addRow("Peso complejidad:",      self.spin_cw)
+            params_form.addRow("Umbral parada (MSE):",   self.spin_es)
+            params_form.addRow("Prof. min. inicial:",    self.spin_mind)
+            params_form.addRow("Prof. max. inicial:",    self.spin_maxd)
+            params_form.addRow("Límite prof. árbol:",    self.spin_hlim)
+
+            reset_btn = QtWidgets.QPushButton("Restaurar valores por defecto")
+            reset_btn.setFixedHeight(28)
+            reset_btn.clicked.connect(self._reset_params)
+            params_form.addRow("", reset_btn)
+
+            # ─────────────────────────────────────────────────────
             control_layout.addWidget(title)
             control_layout.addWidget(subtitle)
             control_layout.addSpacing(12)
             control_layout.addWidget(QtWidgets.QLabel("Función objetivo"))
             control_layout.addWidget(self.expr_edit)
+            control_layout.addSpacing(8)
+            control_layout.addWidget(params_group)
+            control_layout.addSpacing(8)
             control_layout.addWidget(self.run_button)
             control_layout.addStretch(1)
             control_layout.addWidget(QtWidgets.QLabel("Estado"))
@@ -1160,6 +1277,21 @@ que aproxime la función objetivo que tú defines. El algoritmo evoluciona una p
   <li>Consulta los resultados en las pestañas: <b>Resumen, Métricas y Gráficas</b>.</li>
 </ol>
 
+<hr/>                  
+
+<h3 style="color:#34d399;">Como usar los parametros del algoritmo</h3>
+<p>Los parámetros controlan el comportamiento del algoritmo genético. Puedes ajustar:</p>
+<ul>
+    <li><b>Tamaño de población:</b> más individuos pueden mejorar la búsqueda pero aumentan el tiempo de ejecución.</li>
+    <li><b>Generaciones:</b> más generaciones permiten una evolución más completa pero también aumentan el tiempo de ejecución.</li>
+    <li><b>Probabilidad de cruza:</b> controla qué tan a menudo se combinan dos individuos para crear descendencia.</li>
+    <li><b>Probabilidad de mutación:</b> controla qué tan a menudo se modifican los individuos durante la evolución.</li>
+    <li><b>Peso de complejidad:</b> penaliza los individuos más complejos para evitar sobreajuste.</li>
+    <li><b>Umbral de parada temprana:</b> detiene la evolución si no hay mejoras significativas en un número determinado de generaciones.</li>
+    <li><b>Profundidad mínima y máxima del árbol inicial:</b> controla la complejidad de los individuos en la población inicial.</li>
+    <li><b>Límite de profundidad del árbol:</b> evita que los árboles crezcan demasiado durante la evolución, lo que puede causar tiempos de evaluación muy largos o errores de recursión.</li>
+</ul>
+
 <hr/>
 <h3 style="color:#34d399;">Cómo escribir funciones matemáticas</h3>
 <p>Las funciones usan las variables <b>x</b> e <b>y</b>. La sintaxis es Python/SymPy:</p>
@@ -1216,9 +1348,23 @@ que aproxime la función objetivo que tú defines. El algoritmo evoluciona una p
 
             self.run_button.clicked.connect(self._run_experiment)
 
+        def _reset_params(self):
+            self.spin_pop.setValue(POPULATION_SIZE)
+            self.spin_ngen.setValue(N_GENERATIONS)
+            self.spin_cxpb.setValue(CROSSOVER_PROB)
+            self.spin_mutpb.setValue(MUTATION_PROB)
+            self.spin_cw.setValue(COMPLEXITY_WEIGHT)
+            self.spin_es.setValue(EARLY_STOP_THRESHOLD)
+            self.spin_mind.setValue(TREE_MIN_DEPTH)
+            self.spin_maxd.setValue(TREE_MAX_DEPTH)
+            self.spin_hlim.setValue(TREE_HEIGHT_LIMIT)
+
         def _set_running(self, running: bool):
             self.run_button.setEnabled(not running)
             self.expr_edit.setEnabled(not running)
+            for w in (self.spin_pop, self.spin_ngen, self.spin_cxpb, self.spin_mutpb,
+                      self.spin_cw, self.spin_es, self.spin_mind, self.spin_maxd, self.spin_hlim):
+                w.setEnabled(not running)
 
         def _run_experiment(self):
             target_expr = self.expr_edit.text().strip()
@@ -1238,11 +1384,37 @@ que aproxime la función objetivo que tú defines. El algoritmo evoluciona una p
             self.surface_view.clear_image()
             self.tree_view.clear_image()
 
+            # Validate depth ordering
+            if self.spin_mind.value() > self.spin_maxd.value():
+                QtWidgets.QMessageBox.warning(
+                    self, "Parámetros inválidos",
+                    "La profundidad mínima inicial no puede ser mayor que la máxima.",
+                )
+                return
+            if self.spin_maxd.value() > self.spin_hlim.value():
+                QtWidgets.QMessageBox.warning(
+                    self, "Parámetros inválidos",
+                    "La profundidad máxima inicial no puede ser mayor que el límite de profundidad.",
+                )
+                return
+
+            algo_params = {
+                "population_size":       self.spin_pop.value(),
+                "n_generations":         self.spin_ngen.value(),
+                "crossover_prob":        self.spin_cxpb.value(),
+                "mutation_prob":         self.spin_mutpb.value(),
+                "complexity_weight":     self.spin_cw.value(),
+                "early_stop_threshold":  self.spin_es.value(),
+                "tree_min_depth":        self.spin_mind.value(),
+                "tree_max_depth":        self.spin_maxd.value(),
+                "tree_height_limit":     self.spin_hlim.value(),
+            }
+
             self._set_running(True)
             self.status_label.setText("Ejecutando evolución... esto puede tardar unos minutos.")
 
             self._thread = QtCore.QThread(self)
-            self._worker = ExperimentWorker(target_expr)
+            self._worker = ExperimentWorker(target_expr, params=algo_params)
             self._worker.moveToThread(self._thread)
             self._thread.started.connect(self._worker.run)
             self._worker.finished.connect(self._on_finished)

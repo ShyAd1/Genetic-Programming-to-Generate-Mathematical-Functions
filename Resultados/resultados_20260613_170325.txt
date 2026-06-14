@@ -1,0 +1,37 @@
+════════════════════════════════════════════════════════════
+REGRESIÓN SIMBÓLICA CON DEAP — RESULTADOS
+Fecha: 2026-06-13 17:03:25
+════════════════════════════════════════════════════════════
+
+Función objetivo : cos(y)
+Población        : 300
+Generaciones     : 100
+P(cruza)         : 0.8
+P(mutación)      : 0.2
+Peso complejidad : 0.001
+Umbral parada    : 0.01
+Parada anticipada: Sí
+
+────────────────────────────────────────
+MEJOR INDIVIDUO
+────────────────────────────────────────
+Árbol       : np_cos(y)
+Nodos       : 2
+Profundidad : 1
+Fitness     : 2.000000e-03
+Expresión   : cos(y)
+
+────────────────────────────────────────
+MÉTRICAS DE CALIDAD
+────────────────────────────────────────
+  MSE   : 0.000000e+00
+  RMSE  : 0.000000e+00
+  MAE   : 0.000000e+00
+  R²    : 1.000000e+00
+
+────────────────────────────────────────
+EVOLUCIÓN POR GENERACIÓN
+────────────────────────────────────────
+  Gen         MSE mín   Tam. prom
+    0    2.000000e-03        5.32
+    1    2.000000e-03        4.41
